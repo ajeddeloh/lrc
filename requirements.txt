@@ -1,0 +1,3 @@
+matplotlib
+universal_usbtmc
+pyserial
