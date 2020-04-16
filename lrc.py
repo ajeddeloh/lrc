@@ -1,110 +1,112 @@
-import serial, time, cmath
-import universal_usbtmc
+import serial, time, cmath, socket
 import matplotlib.pyplot as plt
 
-kernel_tmc = universal_usbtmc.import_backend("linux_kernel")
+chanSettingsFile = "chan.txt"
+scopeSettingsFile = "scope.txt"
 
-fngen = "/dev/ttyUSB0"
 startFreq = 1000
-freqStep = 500
+freqStep = 3000
 stopFreq = 50000
 resistor = 99.4
 
-scope = kernel_tmc.Instrument("/dev/usbtmc1")
+with open(chanSettingsFile) as f:
+    chanSettings = f.readlines()
 
-def setup_channel(scope, channel):
-    settings = ["bwlimit 20M", "coup ac", "disp on", "inv off", "prob 1", "offset 0", "vern on", "scale 0.05"]
+with open(scopeSettingsFile) as f:
+    scopeSettings = f.readlines()
+
+channels = {
+    "chan1": chanSettings,
+    "chan2": chanSettings,
+    "chan3": ["disp off"],
+    "chan4": ["disp off"],
+}
+
+# connect to scope
+#kernel_tmc = universal_usbtmc.import_backend("linux_kernel")
+#scope = kernel_tmc.Instrument("/dev/usbtmc1")
+scope = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+scope.connect(("192.168.1.42", 5555))
+
+def scopew(command):
+    command += "\n"
+    scope.send(command.encode())
+
+def scopeq(query):
+    return float(scope.recv(BUF_SIZE))
+
+# connect to fn generator
+ser = serial.Serial("/dev/ttyUSB0", 115200)
+def fngen(command):
+    ser.write(command + b'\n')
+    ser.readline()
+
+# base scope settings
+scopew(":meas:clear all")
+for channel, settings in channels.items():
     for setting in settings:
-        scope.write(":chan%d:%s" % channel, setting)
-    scope.write(":meas:source chan%d" % channel)
-    scope.write(":meas:vpp")
+        scopew(":%s:%s" % (channel, setting))
 
-scope.write(":meas:clear all")
-setup_channel(scope, 1)
-setup_channel(scope, 2)
-scope.write(":chan3:disp off")
-scope.write(":chan4:disp off")
-scope.write("meas:rphase")
+for setting in scopeSettings:
+    scopew(":%s" % setting)
 
-scope.write(":trig:mode edge")
-scope.write(":trig:coup hfr")
-scope.write(":trig:coup hfr")
-scope.write(":trig:edge:source chan1")
-scope.write(":trig:edge:slope pos")
-scope.write(":trig:edge:level 0")
-scope.write(":run")
-
-ser = serial.Serial(fngen, 115200)
-ser.write(b'WFN0\n') # turn off ch2
-ser.readline()
-ser.write(b'WMW00\n') # sine
-ser.readline()
-ser.write(b'WMA00.50\n') # 1Vpp
-ser.readline()
-
-fdata = []
-ldata = []
-rdata = []
+# base fn generator settings
+fngen(b'WFN0') # turn off ch2
+fngen(b'WMW00') # sine
+fngen(b'WMA00.50') # 1Vpp
 
 def setchan2(scope):
     # if Vpp is absurd (not in [-1,1]) the scale is too big,
     # back off until it's not
-    scope.write(":acq:type normal")
+    scopew(":acq:type normal")
     time.sleep(.5)
-    scope.write(":meas:source chan2")
+    scopew(":meas:source chan2")
     time.sleep(.5)
-    scale = float(scope.query(":chan2:scale?"))
-    vpp = float(scope.query(":meas:vpp?"))
+    scale = scopeq(":chan2:scale?")
+    vpp = scopeq(":meas:vpp?")
     while vpp < -2 or vpp > 8*scale:
-        scale = float(scope.query(":chan2:scale?"))
-        scope.write(":chan2:scale %e" % (scale*2))
+        scale *= 2
+        scope.write(":chan2:scale %e" % scale)
         time.sleep(1) # settle?
-        vpp = float(scope.query(":meas:vpp?"))
+        vpp = scopeq(":meas:vpp?")
     # set the scale to be reasonable for measured vpp
     scope.write(":chan2:scale %e" % (1.1 * vpp / 8))
 
-def measure(scope, freq):
-    """
-    measure returns L, R
-    measure does not change any scope settings, it just reads them
-    """
-    scope.write(":meas:stat:reset")
-    time.sleep(4)
-    vtotal = float(scope.query(":meas:stat:item? aver, vpp, chan1"))
-    vind = float(scope.query(":meas:stat:item? aver, vpp, chan2"))
-    phase = float(scope.query(":meas:stat:item? aver, rphase, chan1, chan2"))
-    l, r = getL(freq, vtotal, vind, phase)
-    return l, r
+def measure(freq):
+    scopew(":meas:stat:reset")
+    time.sleep(10)
+    vtotal = scopeq(":meas:stat:item? aver, vpp, chan1")
+    vtotdev = scopeq(":meas:stat:item? dev, vpp, chan1")
+    vind = scopeq(":meas:stat:item? aver, vpp, chan2")
+    vinddev = scopeq(":meas:stat:item? dev, vpp, chan2")
+    phase = scopeq(":meas:stat:item? aver, rphase, chan2, chan1")
+    phasedev = scopeq(":meas:stat:item? dev, rphase, chan2, chan1")
+    z, l, = getZLR(freq, vtotal, vind, phase)
+    print(z, l)
+    return z, l
 
-def getL(freq, vtotal, vind, phase):
+def getZLR(freq, vtotal, vind, phase):
     vind = cmath.rect(vind, phase*cmath.pi/180)
     k = vind/vtotal
     z = (-k*resistor)/(k-1)
-    return z.imag/(2*cmath.pi*freq), z.real
+    return z, 1e6*z.imag/(2*cmath.pi*freq)
 
-
+data = []
 for freq in range(startFreq, stopFreq, freqStep):
-    ser.write(b'WMF%d\n'% (freq*1000000)) # 1Vpp
-    ser.readline()
+    fngen(b'WMF%d'% (freq*1000000))
     time.sleep(.1)
     scope.write(":tim:scale %e" % (0.1/freq))
     setchan2(scope)
-    if freq == startFreq:
-        setchan2(scope)
 
     scope.write(":acq:type aver")
-    scope.write(":acq:aver 512")
+    scope.write(":acq:aver 1024")
     scope.write(":acq:mdepth 6000")
     time.sleep(max(9000/freq, 1))
-    l, r = measure(scope, freq)
-    print(l*1e6, r)
-    fdata.append(freq)
-    ldata.append(l*1e6)
-    rdata.append(r)
+    z, l = measure(freq)
+    data.append([freq, z, l])
 
 ser.close()
-
-plt.plot(fdata, ldata)
-plt.plot(fdata, rdata)
+transposed = list(zip(*data))
+plt.plot(transposed[0], list(map(lambda x: x.imag, transposed[1])))
 plt.show()
 
