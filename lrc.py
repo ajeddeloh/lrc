@@ -1,5 +1,8 @@
-import serial, time, cmath, socket
+import serial, time 
 import matplotlib.pyplot as plt
+import numpy as np
+import scipy.fft as fft
+from scope import Rigol1054z
 
 chanSettingsFile = "chan.txt"
 scopeSettingsFile = "scope.txt"
@@ -22,18 +25,7 @@ channels = {
     "chan4": ["disp off"],
 }
 
-# connect to scope
-#kernel_tmc = universal_usbtmc.import_backend("linux_kernel")
-#scope = kernel_tmc.Instrument("/dev/usbtmc1")
-scope = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-scope.connect(("192.168.1.42", 5555))
-
-def scopew(command):
-    command += "\n"
-    scope.send(command.encode())
-
-def scopeq(query):
-    return float(scope.recv(BUF_SIZE))
+scope = Rigol1054z()
 
 # connect to fn generator
 ser = serial.Serial("/dev/ttyUSB0", 115200)
@@ -42,13 +34,12 @@ def fngen(command):
     ser.readline()
 
 # base scope settings
-scopew(":meas:clear all")
 for channel, settings in channels.items():
     for setting in settings:
-        scopew(":%s:%s" % (channel, setting))
+        scope.w("%s:%s" % (channel, setting))
 
 for setting in scopeSettings:
-    scopew(":%s" % setting)
+    scope.w("%s" % setting)
 
 # base fn generator settings
 fngen(b'WFN0') # turn off ch2
@@ -58,55 +49,47 @@ fngen(b'WMA00.50') # 1Vpp
 def setchan2(scope):
     # if Vpp is absurd (not in [-1,1]) the scale is too big,
     # back off until it's not
-    scopew(":acq:type normal")
+    scope.w("meas:source chan2")
     time.sleep(.5)
-    scopew(":meas:source chan2")
-    time.sleep(.5)
-    scale = scopeq(":chan2:scale?")
-    vpp = scopeq(":meas:vpp?")
+    scale = scope.qf("chan2:scale?")
+    vpp = scope.qf("meas:vpp?")
     while vpp < -2 or vpp > 8*scale:
         scale *= 2
-        scope.write(":chan2:scale %e" % scale)
+        scope.w("chan2:scale %e" % scale)
         time.sleep(1) # settle?
-        vpp = scopeq(":meas:vpp?")
+        vpp = scope.qf("meas:vpp?")
     # set the scale to be reasonable for measured vpp
-    scope.write(":chan2:scale %e" % (1.1 * vpp / 8))
+    scope.w("chan2:scale %e" % (1.1 * vpp / 8))
 
-def measure(freq):
-    scopew(":meas:stat:reset")
-    time.sleep(10)
-    vtotal = scopeq(":meas:stat:item? aver, vpp, chan1")
-    vtotdev = scopeq(":meas:stat:item? dev, vpp, chan1")
-    vind = scopeq(":meas:stat:item? aver, vpp, chan2")
-    vinddev = scopeq(":meas:stat:item? dev, vpp, chan2")
-    phase = scopeq(":meas:stat:item? aver, rphase, chan2, chan1")
-    phasedev = scopeq(":meas:stat:item? dev, rphase, chan2, chan1")
-    z, l, = getZLR(freq, vtotal, vind, phase)
-    print(z, l)
-    return z, l
+def measure2(freq):
+    scope.w("sing")
+    ch1, ch2 = scope.grab_all(1), scope.grab_all(2)
+    fft1, fft2 = fft.rfft(ch1[1]), fft.rfft(ch2[1])
+    n_samples = len(ch1[1])
+    bin_size = 1/(n_samples*ch2[2])
+    bin = int(np.round(freq/bin_size))
+    vind = fft.rfft(ch2[1])[bin]
+    vtotal = fft.rfft(ch1[1])[bin]
+    z, l = getZL(freq, vtotal, vind)
+    print(l, bin, np.absolute(vind), np.absolute(vtotal))
+    return l
 
-def getZLR(freq, vtotal, vind, phase):
-    vind = cmath.rect(vind, phase*cmath.pi/180)
+def getZL(freq, vtotal, vind):
     k = vind/vtotal
     z = (-k*resistor)/(k-1)
-    return z, 1e6*z.imag/(2*cmath.pi*freq)
+    return z, 1e6*np.imag(z)/(2*np.pi*freq)
 
 data = []
 for freq in range(startFreq, stopFreq, freqStep):
     fngen(b'WMF%d'% (freq*1000000))
     time.sleep(.1)
-    scope.write(":tim:scale %e" % (0.1/freq))
     setchan2(scope)
 
-    scope.write(":acq:type aver")
-    scope.write(":acq:aver 1024")
-    scope.write(":acq:mdepth 6000")
-    time.sleep(max(9000/freq, 1))
-    z, l = measure(freq)
-    data.append([freq, z, l])
+    l = np.mean([measure2(freq) for x in range(1,10)])
+    data.append([freq, l])
 
 ser.close()
 transposed = list(zip(*data))
-plt.plot(transposed[0], list(map(lambda x: x.imag, transposed[1])))
+plt.plot(transposed[0], transposed[1])
 plt.show()
 
