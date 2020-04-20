@@ -1,4 +1,4 @@
-import serial, time 
+import serial, time, sys
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.fft as fft
@@ -7,9 +7,12 @@ from scope import Rigol1054z
 chanSettingsFile = "chan.txt"
 scopeSettingsFile = "scope.txt"
 
-startFreq = 1000
-freqStep = 3000
-stopFreq = 50000
+if len(sys.argv) != 4:
+    print("usage: lrc <start freq> <stop freq> <freq step>")
+
+startFreq = int(sys.argv[1])
+stopFreq = int(sys.argv[2])
+freqStep = int(sys.argv[3])
 resistor = 99.4
 
 with open(chanSettingsFile) as f:
@@ -18,14 +21,13 @@ with open(chanSettingsFile) as f:
 with open(scopeSettingsFile) as f:
     scopeSettings = f.readlines()
 
-channels = {
-    "chan1": chanSettings,
-    "chan2": chanSettings,
-    "chan3": ["disp off"],
-    "chan4": ["disp off"],
-}
-
 scope = Rigol1054z()
+scope.w(*scopeSettings)
+time.sleep(1)
+tdiv = scope.qf("wav:xinc?")
+scope.w(*["chan1:%s" % setting for setting in chanSettings])
+scope.w(*["chan2:%s" % setting for setting in chanSettings])
+scope.w("chan2:scale 0.001")
 
 # connect to fn generator
 ser = serial.Serial("/dev/ttyUSB0", 115200)
@@ -33,63 +35,49 @@ def fngen(command):
     ser.write(command + b'\n')
     ser.readline()
 
-# base scope settings
-for channel, settings in channels.items():
-    for setting in settings:
-        scope.w("%s:%s" % (channel, setting))
-
-for setting in scopeSettings:
-    scope.w("%s" % setting)
-
 # base fn generator settings
 fngen(b'WFN0') # turn off ch2
 fngen(b'WMW00') # sine
 fngen(b'WMA00.50') # 1Vpp
 
 def setchan2(scope):
-    # if Vpp is absurd (not in [-1,1]) the scale is too big,
-    # back off until it's not
-    scope.w("meas:source chan2")
-    time.sleep(.5)
-    scale = scope.qf("chan2:scale?")
-    vpp = scope.qf("meas:vpp?")
-    while vpp < -2 or vpp > 8*scale:
-        scale *= 2
-        scope.w("chan2:scale %e" % scale)
-        time.sleep(1) # settle?
-        vpp = scope.qf("meas:vpp?")
-    # set the scale to be reasonable for measured vpp
-    scope.w("chan2:scale %e" % (1.1 * vpp / 8))
+    ch2 = scope.grab_all_raw(2)
+    while max(ch2) > 245 or min(ch2) < 15:
+        scale = scope.qf("chan2:scale?")
+        scope.w(("chan2:scale %f" % (scale*2)), "sing", "tfor", timeout=0.1)
+        ch2 = scope.grab_all_raw(2)
 
-def measure2(freq):
-    scope.w("sing")
+def measure(freq):
+    scope.w("sing", "tfor", timeout=0.1)
     ch1, ch2 = scope.grab_all(1), scope.grab_all(2)
     fft1, fft2 = fft.rfft(ch1[1]), fft.rfft(ch2[1])
     n_samples = len(ch1[1])
-    bin_size = 1/(n_samples*ch2[2])
+    bin_size = 1/(n_samples*tdiv)
     bin = int(np.round(freq/bin_size))
-    vind = fft.rfft(ch2[1])[bin]
-    vtotal = fft.rfft(ch1[1])[bin]
-    z, l = getZL(freq, vtotal, vind)
-    print(l, bin, np.absolute(vind), np.absolute(vtotal))
-    return l
+    print(bin, bin_size, n_samples)
+    vL = fft.rfft(ch2[1])[bin]
+    vT = fft.rfft(ch1[1])[bin]
+    return (freq, vT, vL)
 
-def getZL(freq, vtotal, vind):
+def getZLR(freq, vtotal, vind, r):
     k = vind/vtotal
-    z = (-k*resistor)/(k-1)
-    return z, 1e6*np.imag(z)/(2*np.pi*freq)
+    z = (-k*r)/(k-1)
+    return freq, z, 1e6*np.imag(z)/(2*np.pi*freq), np.real(z)
 
 data = []
-for freq in range(startFreq, stopFreq, freqStep):
-    fngen(b'WMF%d'% (freq*1000000))
+for freq in range(startFreq, stopFreq+1, freqStep):
+    # Frequency is set as an integer number of uHz
+    fngen(b'WMF%d'% (freq*1e6))
     time.sleep(.1)
     setchan2(scope)
+    point = measure(freq)
+    data.append(point)
 
-    l = np.mean([measure2(freq) for x in range(1,10)])
-    data.append([freq, l])
+zlrs = [getZLR(point[0], point[1], point[2], resistor) for point in data]
 
 ser.close()
-transposed = list(zip(*data))
-plt.plot(transposed[0], transposed[1])
+transposed = list(zip(*zlrs))
+plt.plot(transposed[0], transposed[2])
+
 plt.show()
 
