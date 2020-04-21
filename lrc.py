@@ -38,14 +38,16 @@ def fngen(command):
 # base fn generator settings
 fngen(b'WFN0') # turn off ch2
 fngen(b'WMW00') # sine
-fngen(b'WMA00.50') # 1Vpp
+fngen(b'WMA02.00') # 4Vpp
 
 def setchan2(scope):
     ch2 = scope.grab_all_raw(2)
     while max(ch2) > 245 or min(ch2) < 15:
         scale = scope.qf("chan2:scale?")
-        scope.w(("chan2:scale %f" % (scale*2)), "sing", "tfor", timeout=0.1)
+        scope.w(("chan2:scale %f" % (scale*2)),
+                "sing", "tfor", timeout=0.1)
         ch2 = scope.grab_all_raw(2)
+    print(max(ch2), min(ch2))
 
 def measure(freq):
     scope.w("sing", "tfor", timeout=0.1)
@@ -57,12 +59,12 @@ def measure(freq):
     print(bin, bin_size, n_samples)
     vL = fft.rfft(ch2[1])[bin]
     vT = fft.rfft(ch1[1])[bin]
-    return (freq, vT, vL)
+    return getZLR(freq, vT, vL, resistor)
 
 def getZLR(freq, vtotal, vind, r):
     k = vind/vtotal
     z = (-k*r)/(k-1)
-    return freq, z, 1e6*np.imag(z)/(2*np.pi*freq), np.real(z)
+    return z, 1e6*np.imag(z)/(2*np.pi*freq), np.real(z)
 
 data = []
 for freq in range(startFreq, stopFreq+1, freqStep):
@@ -70,14 +72,12 @@ for freq in range(startFreq, stopFreq+1, freqStep):
     fngen(b'WMF%d'% (freq*1e6))
     time.sleep(.1)
     setchan2(scope)
-    point = measure(freq)
-    data.append(point)
-
-zlrs = [getZLR(point[0], point[1], point[2], resistor) for point in data]
+    point = [measure(freq)[1] for x in range(0,5)]
+    data.append([freq, point])
 
 ser.close()
-transposed = list(zip(*zlrs))
-plt.plot(transposed[0], transposed[2])
+transposed = list(zip(*data))
+plt.plot(transposed[0], transposed[1])
 
 plt.show()
 
