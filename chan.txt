@@ -1,0 +1,7 @@
+bwlimit 20M
+coup ac
+disp on
+inv off
+prob 1
+offset 0
+vern on

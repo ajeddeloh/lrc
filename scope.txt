@@ -1,0 +1,4 @@
+trig:mode edge
+trig:edge:source chan1
+trig:edge:slope pos
+trig:edge:level 0
